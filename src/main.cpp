@@ -31,6 +31,13 @@ const int pump3  = 17;
 const int pump4  = 5;
 
 /* --------------------------------------------------------------------------
+   Tank-Pins
+   -------------------------------------------------------------------------- */
+// Neuer globaler Wert für deinen Tank (ml)
+float currentTankLevel = 0.0f;
+
+
+/* --------------------------------------------------------------------------
    Pumpenstatus und Kalibrierung
    -------------------------------------------------------------------------- */
 bool pumpStatus[4]    = {false, false, false, false};
@@ -44,14 +51,15 @@ bool calibrationRunning[4] = {false, false, false, false};
    Jeder Eintrag kann mehrere Pumpen gleichzeitig steuern.
    -------------------------------------------------------------------------- */
 struct Program {
-  String days;         // Wochentage als String, z.B. "Mo,Di,Fr"
-  int interval;        // Intervall in (ganzen) Wochen
-  String time;         // "HH:MM"
-  int amount;          // ml
-  bool active;         // Programm an/aus
-  bool pumps[4];       // True => Pumpe i läuft
-  time_t lastRun;      // Unixzeit des letzten Durchlaufs
+  String days;       
+  int interval;      
+  String time;       
+  int amount;        
+  bool active;
+  bool pumps[4];     // beibehalten
+  time_t lastRun;
 };
+
 
 std::vector<Program> programs;
 
@@ -99,43 +107,112 @@ String getCurrentDateTime() {
   return unixTimeToDayString(currentUnixTime);
 }
 
+
+// Check, ob time in HH:MM format gültig ist
+String calculateTankEmptyDate() {
+  float usagePerWeek = 0.0f;
+
+  // Hilfsfunktion: Tage zählen in "Mo,Di,Fr"
+  auto countDays = [](const String &days) {
+    String temp = days + ",";
+    int count=0, start=0;
+    while(true){
+      int idx = temp.indexOf(',', start);
+      if(idx<0) break;
+      count++;
+      start=idx+1;
+    }
+    return count;
+  };
+
+  // Programme durchgehen
+  for(auto &pr : programs){
+    if(!pr.active) continue;
+    int dayCount = countDays(pr.days); 
+    float weeklyAmount = dayCount * pr.amount;
+    usagePerWeek += weeklyAmount;
+  }
+
+  if(usagePerWeek<=0.0f) {
+    // Kein Verbrauch => kein LeerDatum
+    return "";
+  }
+
+  // Wieviel Wochen reicht currentTankLevel?
+  float weeks = currentTankLevel / usagePerWeek;
+  time_t nowSec   = currentUnixTime;
+  time_t deltaSec = (time_t)(weeks * 7 * 24 * 3600);
+  time_t emptySec = nowSec + deltaSec;
+
+  struct tm *tmStruct = localtime(&emptySec);
+  int d  = tmStruct->tm_mday;
+  int mo = tmStruct->tm_mon +1;
+  int y  = tmStruct->tm_year+1900;
+  int hh = tmStruct->tm_hour;
+  int mm = tmStruct->tm_min;
+  char buf[40];
+  snprintf(buf,sizeof(buf),"%02d.%02d.%04d %02d:%02d", d, mo, y, hh, mm);
+  return String(buf);
+}
+
 /* --------------------------------------------------------------------------
    Speichern/Laden der Konfiguration in SPIFFS
    -------------------------------------------------------------------------- */
 void saveConfig() {
-  StaticJsonDocument<4096> doc;
+  DynamicJsonDocument doc(4096);
 
+  // Beispiel: doc["currentDateTime"] = ...
   doc["currentDateTime"] = getCurrentDateTime();
 
-  JsonArray pumpStatusArr = doc.createNestedArray("pumpStatus");
-  for(int i=0; i<4; i++){
-    pumpStatusArr.add(pumpStatus[i]);
+  // Neuer Tanklevel
+  doc["tankLevel"] = currentTankLevel;
+
+  // Pumpenstatus in ein Array
+  {
+    // statt createNestedArray("pumpStatus"):
+    JsonArray arr = doc["pumpStatus"].to<JsonArray>();
+    arr.clear();  // sicherheitshalber leeren, bevor wir einfügen
+    for (int i = 0; i < 4; i++) {
+      arr.add(pumpStatus[i]);
+    }
   }
 
-  JsonArray flowArr = doc.createNestedArray("pumpFlowRate");
-  for(int i=0; i<4; i++){
-    flowArr.add(pumpFlowRate[i]);
+  // PumpFlowRate in ein Array
+  {
+    JsonArray arr = doc["pumpFlowRate"].to<JsonArray>();
+    arr.clear();
+    for (int i = 0; i < 4; i++) {
+      arr.add(pumpFlowRate[i]);
+    }
   }
 
-  JsonArray programsArr = doc.createNestedArray("programs");
-  for(auto &prog : programs){
-    JsonObject p = programsArr.createNestedObject();
-    p["days"]     = prog.days;
-    p["interval"] = prog.interval;
-    p["time"]     = prog.time;
-    p["amount"]   = prog.amount;
-    p["active"]   = prog.active;
-    p["lastRun"]  = (long)prog.lastRun;
+  // Programme
+  {
+    // statt createNestedArray("programs"):
+    JsonArray arr = doc["programs"].to<JsonArray>();
+    arr.clear();
+    for (auto &prog : programs) {
+      // statt createNestedObject():
+      JsonObject p = arr.createNestedObject();
 
-    // bool pumps[4] -> JSON Array
-    JsonArray pa = p.createNestedArray("pumps");
-    for(int i=0;i<4;i++){
-      pa.add(prog.pumps[i]);
+      p["days"]     = prog.days;
+      p["interval"] = prog.interval;
+      p["time"]     = prog.time;
+      p["amount"]   = prog.amount;
+      p["active"]   = prog.active;
+      p["lastRun"]  = (long)prog.lastRun;
+
+      // pumps
+      JsonArray pa = p["pumps"].to<JsonArray>();
+      pa.clear();
+      for (int i = 0; i < 4; i++) {
+        pa.add(prog.pumps[i]);
+      }
     }
   }
 
   File file = SPIFFS.open("/config.json", FILE_WRITE);
-  if(!file){
+  if(!file) {
     Serial.println("Fehler beim Öffnen /config.json zum Schreiben!");
     return;
   }
@@ -146,7 +223,7 @@ void saveConfig() {
 
 void loadConfig() {
   if(!SPIFFS.exists("/config.json")){
-    Serial.println("Keine config.json vorhanden, Standardwerte verwendet.");
+    Serial.println("Keine config.json, Standardwerte");
     return;
   }
   File file = SPIFFS.open("/config.json", FILE_READ);
@@ -155,56 +232,78 @@ void loadConfig() {
     return;
   }
 
-  StaticJsonDocument<4096> doc;
+  DynamicJsonDocument doc(4096);
   DeserializationError err = deserializeJson(doc, file);
   file.close();
-  if(err){
+  if(err) {
     Serial.println("Fehler beim Parsen der config.json!");
     return;
   }
 
-  if(doc["currentDateTime"].is<String>()){
-    currentUnixTime = stringToUnixTime(doc["currentDateTime"].as<String>());
+  // TankLevel
+  // Keine Notwendigkeit für containsKey("tankLevel"), 
+  // man kann direkt checken ob doc["tankLevel"].is<float>()
+  if (doc["tankLevel"].is<float>()) {
+    currentTankLevel = doc["tankLevel"].as<float>();
+  } else {
+    currentTankLevel = 0.0f;
   }
 
-  if(doc["pumpStatus"].is<JsonArray>()){
+  // currentDateTime
+  if (doc["currentDateTime"].is<const char*>()) {
+    String dtStr = doc["currentDateTime"].as<const char*>();
+    currentUnixTime = stringToUnixTime(dtStr);
+  }
+
+  // pumpStatus
+  {
     JsonArray arr = doc["pumpStatus"].as<JsonArray>();
-    for(int i=0; i<4 && i<(int)arr.size(); i++){
-      pumpStatus[i] = arr[i].as<bool>();
-    }
-  }
-
-  if(doc["pumpFlowRate"].is<JsonArray>()){
-    JsonArray arr = doc["pumpFlowRate"].as<JsonArray>();
-    for(int i=0; i<4 && i<(int)arr.size(); i++){
-      pumpFlowRate[i] = arr[i].as<float>();
-    }
-  }
-
-  if(doc["programs"].is<JsonArray>()){
-    programs.clear();
-    JsonArray parr = doc["programs"].as<JsonArray>();
-    for(JsonObject p : parr){
-      Program prog;
-      prog.days     = p["days"]    .as<String>();
-      prog.interval = p["interval"].as<int>();
-      prog.time     = p["time"]    .as<String>();
-      prog.amount   = p["amount"]  .as<int>();
-      prog.active   = p["active"]  .as<bool>();
-      prog.lastRun  = p["lastRun"] | 0L;
-
-      if(p["pumps"].is<JsonArray>()){
-        JsonArray pa = p["pumps"].as<JsonArray>();
-        for(int i=0; i<4 && i<(int)pa.size(); i++){
-          prog.pumps[i] = pa[i].as<bool>();
-        }
+    if(!arr.isNull()) {
+      for(int i=0; i<4 && i<(int)arr.size(); i++){
+        pumpStatus[i] = arr[i].as<bool>();
       }
-      programs.push_back(prog);
+    }
+  }
+
+  // pumpFlowRate
+  {
+    JsonArray arr = doc["pumpFlowRate"].as<JsonArray>();
+    if(!arr.isNull()) {
+      for(int i=0; i<4 && i<(int)arr.size(); i++){
+        pumpFlowRate[i] = arr[i].as<float>();
+      }
+    }
+  }
+
+  // programmes
+  {
+    JsonArray parr = doc["programs"].as<JsonArray>();
+    if(!parr.isNull()) {
+      programs.clear();
+      for (JsonObject p : parr) {
+        Program prog;
+        prog.days     = p["days"]    .as<String>();
+        prog.interval = p["interval"].as<int>();
+        prog.time     = p["time"]    .as<String>();
+        prog.amount   = p["amount"]  .as<int>();
+        prog.active   = p["active"]  .as<bool>();
+        prog.lastRun  = p["lastRun"] | 0L;
+
+        // pumps
+        JsonArray pa = p["pumps"].as<JsonArray>();
+        if(!pa.isNull()) {
+          for(int i=0; i<4 && i<(int)pa.size(); i++){
+            prog.pumps[i] = pa[i].as<bool>();
+          }
+        }
+        programs.push_back(prog);
+      }
     }
   }
 
   Serial.println("Konfiguration geladen.");
 }
+
 
 /* --------------------------------------------------------------------------
    Setter-Funktionen mit automatischer Sicherung
@@ -415,6 +514,7 @@ String createHomePage() {
   <a href="/manual" class="menu-button">Manuelle Steuerung</a>
   <a href="/calibration" class="menu-button">Kalibrierung</a>
   <a href="/programs" class="menu-button">Programme</a>
+  <a href="/tank" class="menu-button">Tankstatus</a> <!-- NEU -->
 </div>
 <script>
 window.onload = async () => {
@@ -528,6 +628,58 @@ async function stopCal(i){
 }
 </script>
 </body></html>)=====";
+  return page;
+}
+
+
+// Tank
+String createTankPage() {
+  String page = R"=====(<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Tankstatus</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+)=====";
+  page += createCSS();
+  page += R"=====(</head><body>)=====";
+  page += createHeader("Tankstatus");
+
+  page += "<h1>Aktueller Wasserstand</h1>";
+  page += "<p>Derzeitiger Inhalt: " + String(currentTankLevel,1) + " ml</p>";
+
+  // Leer-Datum berechnen
+  String emptyDate = calculateTankEmptyDate();
+  page += "<p>Voraussichtlich leer: ";
+  if(emptyDate.isEmpty()) {
+    page += "(keine aktiven Programme oder kein Verbrauch)";
+  } else {
+    page += emptyDate;
+  }
+  page += "</p>";
+
+  // Formular zum Setzen eines neuen Wasserstands
+  page += R"=====(<h2>Wasserstand aktualisieren</h2>
+<form onsubmit="return setTankLevel(event)">
+  <label>Neuer Wasserstand (ml):<br>
+    <input type="number" id="tankInput" placeholder="z.B. 1000" required>
+  </label><br><br>
+  <button type="submit">Setzen</button>
+</form>
+<script>
+async function setTankLevel(e){
+  e.preventDefault();
+  let val = document.getElementById('tankInput').value;
+  if(!val){alert("Bitte Wert eingeben.");return false;}
+  let resp = await fetch('/update_tank?level='+encodeURIComponent(val));
+  let txt  = await resp.text();
+  alert(txt);
+  location.reload();
+}
+</script>
+)=====";
+
+  page += "</body></html>";
   return page;
 }
 
@@ -757,8 +909,14 @@ void runProgram(Program &prog){
         Serial.println("WARNUNG: Pumpe "+String(i+1)+" Flow=0 => skip");
         continue;
       }
-      float sec = prog.amount / pumpFlowRate[i]; 
-      Serial.println(" -> Pumpe "+String(i+1)+" "+String(sec,1)+"s");
+      float sec = prog.amount / pumpFlowRate[i];
+      
+      // NEU: Tankstand verringern
+      currentTankLevel -= prog.amount;
+      if(currentTankLevel<0) currentTankLevel=0;
+      Serial.println(" -> Pumpe "+String(i+1)+" "+String(sec,1)+"s, Tank="+String(currentTankLevel,1)+" ml");
+
+      // Pumpe starten
       startPumpTimed(i, sec);
     }
   }
@@ -775,6 +933,8 @@ bool isDayInList(const String &days, const char* dayShort){
   String look = String(dayShort)+",";
   return (withComma.indexOf(look)>=0);
 }
+
+
 
 // Wochentag, Stunde, Minute aus currentUnixTime
 void getTimeComponents(time_t t, int &wday, int &hour, int &minute){
@@ -832,6 +992,23 @@ void setup() {
   server.on("/programs", [](){
     server.send(200, "text/html; charset=UTF-8", createProgramsPage());
   });
+  server.on("/tank", [](){
+  server.send(200,"text/html; charset=UTF-8", createTankPage());
+  });
+  server.on("/update_tank", [](){
+  if(!server.hasArg("level")){
+    server.send(400,"text/plain","Missing level");
+    return;
+  }
+  float newLevel = server.arg("level").toFloat();
+  if(newLevel<0) newLevel=0;
+  
+  currentTankLevel = newLevel;
+  saveConfig();
+  server.send(200,"text/plain","Wasserstand aktualisiert auf "+
+              String(currentTankLevel,1)+" ml");
+});
+
 
   // AJAX Endpoints
   server.on("/get_pumps", [](){
